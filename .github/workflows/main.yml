@@ -1,0 +1,240 @@
+name: 🚀 Deploy YST-Store with Domain Reservation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - name: 📥 Checkout repository
+      uses: actions/checkout@v4
+
+    - name: 🐍 Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: 📦 Install dependencies
+      run: |
+        if [ -f "requirements.txt" ]; then
+          pip install -r requirements.txt
+        else
+          pip install flask
+          echo "flask" > requirements.txt
+        fi
+
+    - name: ⚡ Install zrok
+      run: |
+        curl -sL https://zrok.io/install | sudo bash
+        zrok version
+
+    - name: 🔑 Authenticate zrok
+      run: |
+        zrok enable 9PBrLPS6IYm0
+        sleep 5
+
+    - name: 🏷️ Reserve Domain (yst-store)
+      id: reserve-domain
+      run: |
+        echo "📝 Attempting to reserve domain: yst-store"
+        
+        # محاولة حجز الدومين
+        if zrok reserve yst-store 2>&1 | tee reserve.log; then
+          echo "✅ Domain 'yst-store' reserved successfully"
+          echo "RESERVED=true" >> $GITHUB_ENV
+          echo "RESERVED_DOMAIN=yst-store" >> $GITHUB_ENV
+        else
+          echo "⚠️ Domain reservation failed, checking status..."
+          
+          # تحقق إذا الدومين محجوز مسبقاً
+          if grep -q "already exists" reserve.log; then
+            echo "ℹ️ Domain already reserved (might be yours)"
+            echo "RESERVED=true" >> $GITHUB_ENV
+            echo "RESERVED_DOMAIN=yst-store" >> $GITHUB_ENV
+          else
+            echo "❌ Cannot reserve domain, will use public domain"
+            echo "RESERVED=false" >> $GITHUB_ENV
+            echo "RESERVED_DOMAIN=public" >> $GITHUB_ENV
+          fi
+        fi
+
+    - name: 🚀 Start main.py on port 5000
+      run: |
+        echo "🚀 Starting main.py..."
+        
+        # إنهاء أي عملية على البورت 5000
+        fuser -k 5000/tcp 2>/dev/null || true
+        
+        # تشغيل التطبيق
+        nohup python main.py > app_output.log 2>&1 &
+        echo $! > app_pid.txt
+        
+        # انتظار واختبار
+        for i in {1..15}; do
+          if curl -s -f http://localhost:5000 > /dev/null 2>&1; then
+            echo "✅ Application is running on port 5000"
+            echo "=== App output (last 5 lines) ==="
+            tail -5 app_output.log
+            break
+          fi
+          echo "⏳ Waiting for application... ($i/15)"
+          sleep 2
+          
+          if [ $i -eq 15 ]; then
+            echo "❌ Application failed to start"
+            echo "=== Full app output ==="
+            cat app_output.log
+            exit 1
+          fi
+        done
+
+    - name: 🌐 Start zrok Tunnel with Reserved Domain
+      id: start-tunnel
+      run: |
+        echo "🔗 Starting zrok tunnel..."
+        
+        if [ "$RESERVED" = "true" ]; then
+          echo "Using RESERVED domain: yst-store"
+          
+          # بدء النفق مع الدومين المحجوز
+          zrok share reserved http://localhost:5000 yst-store > tunnel.log 2>&1 &
+          TUNNEL_PID=$!
+          echo $TUNNEL_PID > tunnel_pid.txt
+          
+          # الرابط المتوقع للدومين المحجوز
+          EXPECTED_URL="https://yst-store.shares.zrok.io"
+          echo "Expected URL: $EXPECTED_URL"
+          
+        else
+          echo "Using PUBLIC domain"
+          
+          # بدء النفق العام
+          zrok share public http://localhost:5000 > tunnel.log 2>&1 &
+          TUNNEL_PID=$!
+          echo $TUNNEL_PID > tunnel_pid.txt
+          
+          EXPECTED_URL="public"
+        fi
+        
+        # انتظار بدء النفق
+        sleep 20
+        
+        # الحصول على الرابط الفعلي
+        if [ "$RESERVED" = "true" ]; then
+          FINAL_URL="$EXPECTED_URL"
+        else
+          # استخراج الرابط العام من logs
+          FINAL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.pub\.zrok\.io' tunnel.log | head -1)
+          
+          if [ -z "$FINAL_URL" ]; then
+            # محاولة أخرى باستخدام zrok info
+            sleep 5
+            zrok info > info.log 2>&1
+            FINAL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.pub\.zrok\.io' info.log | head -1)
+          fi
+        fi
+        
+        if [ -z "$FINAL_URL" ]; then
+          echo "❌ Failed to get zrok URL"
+          echo "=== Tunnel log ==="
+          cat tunnel.log
+          exit 1
+        fi
+        
+        echo "✅ Tunnel started successfully!"
+        echo "🌐 Live URL: $FINAL_URL"
+        
+        # حفظ المتغيرات
+        echo "FINAL_URL=$FINAL_URL" >> $GITHUB_ENV
+        echo "DEPLOYMENT_TIME=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
+
+    - name: 📋 Create Deployment Report
+      run: |
+        cat > deployment-report.md << EOF
+        # 🚀 YST-Store Deployment Report
+        
+        ## ✅ Deployment Successful
+        **Live URL:** [$FINAL_URL]($FINAL_URL)
+        **Status:** 🟢 Active
+        **Deployment Time:** $DEPLOYMENT_TIME
+        
+        ## 🔧 Configuration
+        - **Domain Type:** $([ "$RESERVED" = "true" ] && echo "Reserved Domain (yst-store)" || echo "Public Domain")
+        - **Application:** main.py
+        - **Port:** 5000
+        - **Python Version:** 3.9
+        
+        ## 🧪 Quick Tests
+        \`\`\`bash
+        # Test home page
+        curl $FINAL_URL
+        
+        # Health check (if available)
+        curl $FINAL_URL/health
+        \`\`\`
+        
+        ## ⚠️ Important Notes
+        1. This tunnel will remain active for **15 minutes maximum**
+        2. The URL will stop working once this workflow completes
+        3. For permanent hosting, consider GitHub Pages or other services
+        
+        ## 📊 Logs
+        - Application logs: \`app_output.log\`
+        - Tunnel logs: \`tunnel.log\`
+        EOF
+        
+        # حفظ الرابط في ملف نصي
+        echo "$FINAL_URL" > live-url.txt
+        echo "DOMAIN_TYPE=$([ "$RESERVED" = "true" ] && echo "reserved" || echo "public")" >> deployment-info.txt
+
+    - name: 📤 Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: yst-store-deployment-${{ github.run_id }}
+        path: |
+          deployment-report.md
+          live-url.txt
+          deployment-info.txt
+          app_output.log
+          tunnel.log
+        retention-days: 7
+
+    - name: 📢 Post Summary
+      run: |
+        echo "## 🎉 YST-Store Deployed Successfully!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🌐 **Live URL**" >> $GITHUB_STEP_SUMMARY
+        echo "[$FINAL_URL]($FINAL_URL)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📊 **Deployment Details**" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status:** ✅ Active" >> $GITHUB_STEP_SUMMARY
+        echo "- **Domain:** $([ "$RESERVED" = "true" ] && echo '`yst-store.shares.zrok.io` (Reserved)' || echo 'Public Domain')" >> $GITHUB_STEP_SUMMARY
+        echo "- **Port:** 5000" >> $GITHUB_STEP_SUMMARY
+        echo "- **Main File:** \`main.py\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Deployment Time:** $DEPLOYMENT_TIME" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ⚡ **Quick Test**" >> $GITHUB_STEP_SUMMARY
+        echo '```bash' >> $GITHUB_STEP_SUMMARY
+        echo "curl -s $FINAL_URL | grep -o '<title>[^<]*' | cut -d'>' -f2" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+    - name: 🕒 Keep Alive (10 minutes)
+      run: |
+        echo "⏳ Keeping tunnel active for 10 minutes..."
+        echo "📡 URL: $FINAL_URL"
+        echo "" 
+        echo "You can test the URL now in your browser!"
+        echo "This workflow will auto-terminate after timeout."
+        
+        # عد تنازلي
+        for i in {1..600}; do
+          if [ $((i % 60)) -eq 0 ]; then
+            echo "⏰ Active for $((i/60)) minute(s)..."
+          fi
+          sleep 1
+        done
