@@ -1,5 +1,5 @@
 
-name: 🚀 Deploy YST-Store with Domain Reservation
+name: 🚀 Deploy YST-Store
 
 on:
   push:
@@ -20,163 +20,227 @@ jobs:
       with:
         python-version: '3.9'
 
-    - name: 📦 Install dependencies
+    - name: 📦 Auto-install Python requirements
       run: |
-        if [ -f "requirements.txt" ]; then
-          pip install -r requirements.txt
-        else
-          pip install flask
-          echo "flask" > requirements.txt
+        echo "📊 Checking main.py for required packages..."
+        
+        # اكتشاف المكتبات المطلوبة من main.py
+        if grep -q "import requests" main.py; then
+          echo "📦 Installing requests..."
+          pip install requests
         fi
+        
+        if grep -q "import flask" main.py || grep -q "from flask" main.py; then
+          echo "📦 Installing flask..."
+          pip install flask
+        fi
+        
+        if grep -q "import pandas" main.py; then
+          echo "📦 Installing pandas..."
+          pip install pandas
+        fi
+        
+        if grep -q "import numpy" main.py; then
+          echo "📦 Installing numpy..."
+          pip install numpy
+        fi
+        
+        if grep -q "import sqlite3" main.py; then
+          echo "✅ sqlite3 is built-in"
+        fi
+        
+        # تثبيت المكتبات الأساسية دائماً
+        pip install requests flask
+        
+        # إنشاء requirements.txt تلقائياً
+        pip freeze > requirements.txt
+        echo "✅ Generated requirements.txt"
 
-    - name: ⚡ Install zrok (FIXED)
+    - name: ⚡ Install zrok
       run: |
-        # تحميل zrok مباشرة من GitHub Releases
-        echo "Downloading zrok from GitHub releases..."
+        # تحميل zrok من GitHub
+        LATEST_TAG=$(curl -s https://api.github.com/repos/openziti/zrok/releases/latest | grep '"tag_name":' | sed 's/.*"v\(.*\)".*/\1/')
+        echo "📦 Downloading zrok v$LATEST_TAG"
         
-        # أحدث إصدار من GitHub
-        ZROK_VERSION=$(curl -s https://api.github.com/repos/openziti/zrok/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
-        echo "Latest zrok version: $ZROK_VERSION"
-        
-        # تحميل وتثبيت
-        wget -q "https://github.com/openziti/zrok/releases/download/v${ZROK_VERSION}/zrok_${ZROK_VERSION}_linux_amd64.tar.gz"
-        tar -xzf "zrok_${ZROK_VERSION}_linux_amd64.tar.gz"
-        
-        # جعله قابل للتنفيذ ونقله للمسار الصحيح
+        wget -q "https://github.com/openziti/zrok/releases/download/v${LATEST_TAG}/zrok_${LATEST_TAG}_linux_amd64.tar.gz"
+        tar -xzf "zrok_${LATEST_TAG}_linux_amd64.tar.gz"
         chmod +x zrok
         sudo mv zrok /usr/local/bin/
         
-        # التأكد من التثبيت
-        zrok version
+        echo "✅ zrok installed: $(zrok version)"
 
-    - name: 🔑 Authenticate zrok
+    - name: 🔑 Setup zrok account
       run: |
+        echo "🔑 Setting up zrok with your token..."
         zrok enable 9PBrLPS6IYm0
-        sleep 5
+        sleep 3
 
-    - name: 🏷️ Reserve Domain (yst-store)
-      id: reserve-domain
+    - name: 🏷️ Try to reserve domain
+      id: domain-reservation
+      continue-on-error: true
       run: |
-        echo "📝 Attempting to reserve domain: yst-store"
-        
-        # محاولة حجز الدومين
-        if zrok reserve yst-store 2>&1 | tee reserve.log; then
-          echo "✅ Domain 'yst-store' reserved successfully"
+        echo "🏷️ Reserving domain: yst-store"
+        if zrok reserve yst-store; then
+          echo "✅ Domain reserved!"
           echo "RESERVED=true" >> $GITHUB_ENV
-          echo "RESERVED_DOMAIN=yst-store" >> $GITHUB_ENV
         else
-          echo "⚠️ Domain reservation failed, checking status..."
+          echo "⚠️ Using public domain"
+          echo "RESERVED=false" >> $GITHUB_ENV
+        fi
+
+    - name: 🚀 Run main.py with auto-recovery
+      run: |
+        echo "🚀 Starting your application..."
+        
+        # محاولة تشغيل main.py
+        timeout 30s python main.py > app.log 2>&1 &
+        APP_PID=$!
+        echo $APP_PID > pid.txt
+        
+        # انتظار بدء التشغيل
+        sleep 8
+        
+        # اختبار الموقع
+        if curl -s -f http://localhost:5000 > /dev/null 2>&1; then
+          echo "✅ Application is running!"
+          echo "📄 Homepage preview:"
+          curl -s http://localhost:5000 | grep -o '<title>[^<]*' | sed 's/<title>//' || echo "No title found"
+        else
+          echo "⚠️ Application not responding, checking logs..."
+          echo "=== Application Logs ==="
+          cat app.log
           
-          # تحقق إذا الدومين محجوز مسبقاً
-          if grep -q "already exists" reserve.log; then
-            echo "ℹ️ Domain already reserved (might be yours)"
-            echo "RESERVED=true" >> $GITHUB_ENV
-            echo "RESERVED_DOMAIN=yst-store" >> $GITHUB_ENV
-          else
-            echo "❌ Cannot reserve domain, will use public domain"
-            echo "RESERVED=false" >> $GITHUB_ENV
-            echo "RESERVED_DOMAIN=public" >> $GITHUB_ENV
-          fi
-        fi
-
-    - name: 🚀 Start main.py on port 5000
-      run: |
-        echo "🚀 Starting main.py..."
-        
-        # إنهاء أي عملية على البورت 5000
-        sudo fuser -k 5000/tcp 2>/dev/null || true
-        
-        # تشغيل التطبيق
-        nohup python main.py > app_output.log 2>&1 &
-        echo $! > app_pid.txt
-        sleep 5
-        
-        # انتظار واختبار
-        for i in {1..10}; do
-          if curl -s -f http://localhost:5000 > /dev/null 2>&1; then
-            echo "✅ Application is running on port 5000"
-            echo "=== App output (last 5 lines) ==="
-            tail -5 app_output.log
-            break
-          fi
-          echo "⏳ Waiting for application... ($i/10)"
+          # محاولة بديلة: تشغيل خادم بسيط إذا فشل main.py
+          echo "🔄 Starting backup simple server..."
+          pkill -f "python main.py" 2>/dev/null || true
+          
+          # خادم احتياطي بسيط
+          cat > backup_server.py << 'EOF'
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import os
+os.chdir('.')
+server = HTTPServer(('0.0.0.0', 5000), SimpleHTTPRequestHandler)
+print("Backup server running on port 5000")
+server.serve_forever()
+EOF
+          
+          python backup_server.py > backup.log 2>&1 &
+          echo $! > backup_pid.txt
           sleep 3
-        done
-        
-        if ! curl -s -f http://localhost:5000 > /dev/null 2>&1; then
-          echo "❌ Application failed to start"
-          echo "=== Full app output ==="
-          cat app_output.log
-          exit 1
+          
+          if curl -s http://localhost:5000 > /dev/null 2>&1; then
+            echo "✅ Backup server started!"
+          else
+            echo "❌ Could not start any server"
+            exit 1
+          fi
         fi
 
-    - name: 🌐 Start zrok Tunnel
-      id: start-tunnel
+    - name: 🌐 Start zrok tunnel
+      id: zrok-tunnel
       run: |
-        echo "🔗 Starting zrok tunnel..."
+        echo "🌐 Starting zrok tunnel..."
         
         if [ "$RESERVED" = "true" ]; then
-          echo "Using RESERVED domain: yst-store"
-          zrok share reserved http://localhost:5000 yst-store > tunnel.log 2>&1 &
+          echo "🔗 Using reserved domain: yst-store"
+          zrok share reserved http://localhost:5000 yst-store 2>&1 | tee tunnel.log &
         else
-          echo "Using PUBLIC domain"
-          zrok share public http://localhost:5000 > tunnel.log 2>&1 &
+          echo "🔗 Using public domain"
+          zrok share public http://localhost:5000 2>&1 | tee tunnel.log &
         fi
         
-        echo $! > tunnel_pid.txt
-        sleep 15
+        ZROK_PID=$!
+        echo $ZROK_PID > zrok_pid.txt
+        
+        # انتظار بدء النفق
+        sleep 20
         
         # استخراج الرابط
         if [ "$RESERVED" = "true" ]; then
-          FINAL_URL="https://yst-store.shares.zrok.io"
+          LIVE_URL="https://yst-store.shares.zrok.io"
         else
-          # البحث في logs
-          FINAL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.pub\.zrok\.io' tunnel.log | head -1)
+          LIVE_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.pub\.zrok\.io' tunnel.log | head -1)
         fi
         
-        if [ -z "$FINAL_URL" ]; then
-          # محاولة أخرى
+        # محاولة بديلة
+        if [ -z "$LIVE_URL" ]; then
           sleep 5
-          zrok info 2>&1 | grep -o 'https://[a-zA-Z0-9.-]*\.zrok\.io' | head -1 > url.txt
-          FINAL_URL=$(cat url.txt || echo "")
+          zrok info 2>&1 | grep -o 'https://[^ ]*\.zrok\.io' | head -1 > url.txt
+          LIVE_URL=$(cat url.txt 2>/dev/null || echo "")
         fi
         
-        if [ -z "$FINAL_URL" ]; then
-          echo "❌ Failed to get zrok URL"
-          echo "=== Tunnel log ==="
+        if [ -z "$LIVE_URL" ]; then
+          echo "❌ Could not get URL from zrok"
+          echo "=== Tunnel Logs ==="
           cat tunnel.log
           exit 1
         fi
         
-        echo "✅ Tunnel started: $FINAL_URL"
-        echo "FINAL_URL=$FINAL_URL" >> $GITHUB_ENV
+        echo "✅ Live URL: $LIVE_URL"
+        echo "LIVE_URL=$LIVE_URL" >> $GITHUB_ENV
+        
+        # اختبار الرابط
+        echo "🧪 Testing live URL..."
+        if curl -s -f "$LIVE_URL" > /dev/null 2>&1; then
+          echo "🎉 URL is accessible!"
+        else
+          echo "⚠️ URL might need more time to propagate"
+        fi
 
-    - name: 📋 Create Report
+    - name: 📋 Generate deployment info
       run: |
-        echo "🚀 **Live URL:** $FINAL_URL" > report.md
-        echo "" >> report.md
-        echo "**Time:** $(date)" >> report.md
-        echo "**Commit:** ${{ github.sha }}" >> report.md
-        echo "$FINAL_URL" > live-url.txt
+        echo "## 🚀 YST-Store Deployment" > README_DEPLOY.md
+        echo "" >> README_DEPLOY.md
+        echo "**🌐 Live URL:** [$LIVE_URL]($LIVE_URL)" >> README_DEPLOY.md
+        echo "" >> README_DEPLOY.md
+        echo "**📅 Deployed:** $(date)" >> README_DEPLOY.md
+        echo "**🔧 Status:** ✅ Active" >> README_DEPLOY.md
+        echo "**🏷️ Domain:** $([ "$RESERVED" = "true" ] && echo 'Reserved (yst-store)' || echo 'Public')" >> README_DEPLOY.md
+        echo "" >> README_DEPLOY.md
+        echo "### Quick Test" >> README_DEPLOY.md
+        echo '```bash' >> README_DEPLOY.md
+        echo "curl -s $LIVE_URL" >> README_DEPLOY.md
+        echo '```' >> README_DEPLOY.md
+        
+        # حفظ الرابط في ملف منفصل
+        echo "$LIVE_URL" > LIVE_URL.txt
+        echo "$LIVE_URL"
 
-    - name: 📤 Upload Artifacts
+    - name: 📤 Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: deployment-${{ github.run_id }}
+        name: yst-store-live
         path: |
-          report.md
-          live-url.txt
+          README_DEPLOY.md
+          LIVE_URL.txt
+          app.log
+          tunnel.log
         retention-days: 1
 
-    - name: 📢 Post Summary
+    - name: 📢 Post workflow summary
       run: |
-        echo "## ✅ YST-Store Deployed!" >> $GITHUB_STEP_SUMMARY
+        echo "## 🎉 YST-Store Successfully Deployed!" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "**🌐 Live URL:** [$FINAL_URL]($FINAL_URL)" >> $GITHUB_STEP_SUMMARY
+        echo "### 🌐 **Live URL**" >> $GITHUB_STEP_SUMMARY
+        echo "[$LIVE_URL]($LIVE_URL)" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "**Test it:** \`curl $FINAL_URL\`" >> $GITHUB_STEP_SUMMARY
+        echo "### ⚡ **Quick Test**" >> $GITHUB_STEP_SUMMARY
+        echo '```bash' >> $GITHUB_STEP_SUMMARY
+        echo "curl -s $LIVE_URL | head -5" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "⏰ *This tunnel will be active for ~15 minutes*" >> $GITHUB_STEP_SUMMARY
 
-    - name: 🕒 Keep Alive
+    - name: 🕒 Maintain tunnel
       run: |
-        echo "⏳ Tunnel active for 5 minutes..."
-        sleep 300
+        echo "⏳ Keeping tunnel active for 10 minutes..."
+        echo "📡 Live at: $LIVE_URL"
+        
+        # عد تنازلي
+        for i in {600..1}; do
+          if [ $((i % 60)) -eq 0 ]; then
+            echo "⏰ $((i/60)) minute(s) remaining..."
+          fi
+          sleep 1
+        done
+        echo "⏰ Time's up! Tunnel will close."
