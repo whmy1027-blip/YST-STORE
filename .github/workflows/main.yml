@@ -7,41 +7,101 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-python@v4
-      with:
-        python-version: '3.9'
-    
-    - name: Install dependencies
-      run: pip install requests flask
-    
-    - name: Install zrok
-      run: |
-        wget -q https://github.com/openziti/zrok/releases/latest/download/zrok_linux_amd64.tar.gz
-        tar -xzf zrok_linux_amd64.tar.gz
-        sudo mv zrok /usr/local/bin/
-    
-    - name: Setup zrok
-      run: |
-        zrok enable 9PBrLPS6IYm0
-        sleep 3
-        zrok reserve yst-store 2>/dev/null || true
-    
-    - name: Start app
-      run: |
-        python main.py &
-        sleep 10
-    
-    - name: Start tunnel
-      run: |
-        zrok share reserved http://localhost:5000 yst-store 2>&1 | tee tunnel.log &
-        sleep 15
-        URL=$(grep -o 'https://[^ ]*\.zrok\.io' tunnel.log | head -1)
-        echo "LIVE_URL=$URL" >> $GITHUB_ENV
-    
-    - name: Show URL
-      run: echo "🌐 LIVE: $LIVE_URL"
-    
-    - name: Keep alive
-      run: sleep 300
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: 📦 Install dependencies
+        run: |
+          pip install requests flask
+          pip install --upgrade pip
+
+      - name: ⚡ Install zrok
+        run: |
+          wget -q https://github.com/openziti/zrok/releases/latest/download/zrok_linux_amd64.tar.gz
+          tar -xzf zrok_linux_amd64.tar.gz
+          chmod +x zrok
+          sudo mv zrok /usr/local/bin/
+
+      - name: 🔑 Setup zrok
+        run: |
+          zrok enable 9PBrLPS6IYm0
+          sleep 5
+          zrok reserve yst-store 2>/dev/null || true
+
+      - name: 🚀 Start application
+        run: |
+          python main.py > app.log 2>&1 &
+          echo $! > app_pid.txt
+          sleep 12
+          
+          # Test if app is running
+          if curl -s -f http://localhost:5000 > /dev/null; then
+            echo "✅ Application started successfully"
+          else
+            echo "❌ Application failed to start"
+            echo "=== App logs ==="
+            cat app.log
+            exit 1
+          fi
+
+      - name: 🌐 Start zrok tunnel
+        id: tunnel
+        run: |
+          # Start tunnel
+          zrok share reserved http://localhost:5000 yst-store 2>&1 | tee tunnel.log &
+          echo $! > tunnel_pid.txt
+          sleep 20
+          
+          # Get URL
+          if grep -q "https://yst-store.shares.zrok.io" tunnel.log; then
+            echo "LIVE_URL=https://yst-store.shares.zrok.io" >> $GITHUB_ENV
+          else
+            URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.pub\.zrok\.io' tunnel.log | head -1)
+            if [ -z "$URL" ]; then
+              zrok info > info.log 2>&1
+              URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.zrok\.io' info.log | head -1)
+            fi
+            echo "LIVE_URL=$URL" >> $GITHUB_ENV
+          fi
+          
+          echo "URL: $LIVE_URL"
+
+      - name: 📢 Display live URL
+        run: |
+          echo "========================================"
+          echo "🎉 YST-Store is now LIVE!"
+          echo "🌐 URL: $LIVE_URL"
+          echo "========================================"
+          echo ""
+          echo "⏰ Tunnel will stay active for 5 minutes"
+
+      - name: 📤 Save URL artifact
+        run: |
+          echo "$LIVE_URL" > LIVE_URL.txt
+          echo "Deployment Time: $(date)" >> LIVE_URL.txt
+          echo "Commit: ${{ github.sha }}" >> LIVE_URL.txt
+
+      - name: ⬆️ Upload URL file
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-url
+          path: LIVE_URL.txt
+          retention-days: 1
+
+      - name: 🕒 Keep alive (5 minutes)
+        run: |
+          echo "🕐 Tunnel active for 5 minutes..."
+          for i in {300..1}; do
+            if [ $((i % 60)) -eq 0 ]; then
+              minutes=$((i / 60))
+              echo "⏰ $minutes minute(s) remaining..."
+            fi
+            sleep 1
+          done
